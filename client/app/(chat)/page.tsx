@@ -3,7 +3,7 @@
 import { Loader2 } from 'lucide-react'
 import ContactList from './_components/contact-list'
 import { useEffect, useRef, useState } from 'react'
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import AddContact from './_components/add-contact'
 import { useCurrentContact } from '@/hooks/use-current'
 import { useForm } from 'react-hook-form'
@@ -21,19 +21,23 @@ import { toast } from '@/hooks/use-toast'
 import { io } from 'socket.io-client'
 import { useAuth } from '@/hooks/use-auth'
 import useAudio from '@/hooks/use-audio'
+import { CONST } from '@/lib/constants'
 
 const HomePage = () => {
 	const [contacts, setContacts] = useState<IUser[]>([])
 	const [messages, setMessages] = useState<IMessage[]>([])
 
 	const { setCreating, setLoading, isLoading, setLoadMessages } = useLoading()
-	const { currentContact } = useCurrentContact()
+	const { currentContact, editedMessage, setEditedMessage } = useCurrentContact()
 	const { data: session } = useSession()
 	const { setOnlineUsers } = useAuth()
 	const { playSound } = useAudio()
 
 	const router = useRouter()
+	const searchParams = useSearchParams()
 	const socket = useRef<ReturnType<typeof io> | null>(null)
+
+	const CONTACT_ID = searchParams.get('chat')
 
 	const contactForm = useForm<z.infer<typeof emailSchema>>({
 		resolver: zodResolver(emailSchema),
@@ -68,6 +72,13 @@ const HomePage = () => {
 				headers: { Authorization: `Bearer ${token}` },
 			})
 			setMessages(data.messages)
+			setContacts(prev =>
+				prev.map(item =>
+					item._id === currentContact?._id
+						? { ...item, lastMessage: item.lastMessage ? { ...item.lastMessage, status: CONST.READ } : null }
+						: item
+				)
+			)
 		} catch {
 			toast({ description: 'Cannot fetch messages', variant: 'destructive' })
 		} finally {
@@ -104,13 +115,60 @@ const HomePage = () => {
 					const isExist = prev.some(item => item._id === newMessage._id)
 					return isExist ? prev : [...prev, newMessage]
 				})
+				setContacts(prev => {
+					return prev.map(contact => {
+						if (contact._id === sender._id) {
+							return {
+								...contact,
+								lastMessage: { ...newMessage, status: CONTACT_ID === sender._id ? CONST.READ : newMessage.status },
+							}
+						}
+						return contact
+					})
+				})
 				toast({ title: 'New message', description: `${sender?.email.split('@')[0]} sent you a message` })
 				if (!receiver.muted) {
 					playSound(receiver.notificationSound)
 				}
 			})
+
+			socket.current?.on('getReadMessages', (messages: IMessage[]) => {
+				setMessages(prev => {
+					return prev.map(item => {
+						const message = messages.find(msg => msg._id === item._id)
+						return message ? { ...item, status: CONST.READ } : item
+					})
+				})
+			})
+
+			socket.current?.on('getUpdatedMessage', ({ updatedMessage, sender }: GetSocketType) => {
+				setMessages(prev =>
+					prev.map(item =>
+						item._id === updatedMessage._id ? { ...item, reaction: updatedMessage.reaction, text: updatedMessage.text } : item
+					)
+				)
+				setContacts(prev =>
+					prev.map(item =>
+						item._id === sender._id
+							? { ...item, lastMessage: item.lastMessage?._id === updatedMessage._id ? updatedMessage : item.lastMessage }
+							: item
+					)
+				)
+			})
+
+			socket.current?.on('getDeletedMessage', ({ deletedMessage, sender, filteredMessages }: GetSocketType) => {
+				setMessages(prev => prev.filter(item => item._id !== deletedMessage._id))
+				const lastMessage = filteredMessages.length ? filteredMessages[filteredMessages.length - 1] : null
+				setContacts(prev =>
+					prev.map(item =>
+						item._id === sender._id
+							? { ...item, lastMessage: item.lastMessage?._id === deletedMessage._id ? lastMessage : item.lastMessage }
+							: item
+					)
+				)
+			})
 		}
-	}, [session?.currentUser, socket])
+	}, [session?.currentUser, socket, CONTACT_ID])
 
 	useEffect(() => {
 		if (currentContact?._id) {
@@ -139,6 +197,15 @@ const HomePage = () => {
 		}
 	}
 
+	const onSubmitMessage = async (values: z.infer<typeof messageSchema>) => {
+		setCreating(true)
+		if (editedMessage?._id) {
+			onEditMessage(editedMessage._id, values.text)
+		} else {
+			onSendMessage(values)
+		}
+	}
+
 	const onSendMessage = async (values: z.infer<typeof messageSchema>) => {
 		setCreating(true)
 		const token = await generateToken(session?.currentUser?._id)
@@ -149,6 +216,11 @@ const HomePage = () => {
 				{ headers: { Authorization: `Bearer ${token}` } }
 			)
 			setMessages(prev => [...prev, data.newMessage])
+			setContacts(prev =>
+				prev.map(item =>
+					item._id === currentContact?._id ? { ...item, lastMessage: { ...data.newMessage, status: CONST.READ } } : item
+				)
+			)
 			messageForm.reset()
 			socket.current?.emit('sendMessage', { newMessage: data.newMessage, receiver: data.receiver, sender: data.sender })
 		} catch {
@@ -158,32 +230,134 @@ const HomePage = () => {
 		}
 	}
 
+	const onEditMessage = async (messageId: string, text: string) => {
+		const token = await generateToken(session?.currentUser?._id)
+		try {
+			const { data } = await axiosClient.put<{ updatedMessage: IMessage }>(
+				`/api/user/message/${messageId}`,
+				{ text },
+				{ headers: { Authorization: `Bearer ${token}` } }
+			)
+			setMessages(prev =>
+				prev.map(item => (item._id === data.updatedMessage._id ? { ...item, text: data.updatedMessage.text } : item))
+			)
+			socket.current?.emit('updateMessage', {
+				updatedMessage: data.updatedMessage,
+				receiver: currentContact,
+				sender: session?.currentUser,
+			})
+			messageForm.reset()
+			setContacts(prev =>
+				prev.map(item =>
+					item._id === currentContact?._id
+						? { ...item, lastMessage: item.lastMessage?._id === messageId ? data.updatedMessage : item.lastMessage }
+						: item
+				)
+			)
+			setEditedMessage(null)
+		} catch {
+			toast({ description: 'Cannot edit message', variant: 'destructive' })
+		}
+	}
+
+	const onReadMessages = async () => {
+		const receivedMessages = messages
+			.filter(message => message.receiver._id === session?.currentUser?._id)
+			.filter(message => message.status !== CONST.READ)
+
+		if (receivedMessages.length === 0) return
+		const token = await generateToken(session?.currentUser?._id)
+		try {
+			const { data } = await axiosClient.post<{ messages: IMessage[] }>(
+				'/api/user/message-read',
+				{ messages: receivedMessages },
+				{ headers: { Authorization: `Bearer ${token}` } }
+			)
+			socket.current?.emit('readMessages', { messages: data.messages, receiver: currentContact })
+			setMessages(prev => {
+				return prev.map(item => {
+					const message = data.messages.find(msg => msg._id === item._id)
+					return message ? { ...item, status: CONST.READ } : item
+				})
+			})
+		} catch {
+			toast({ description: 'Cannot read messages', variant: 'destructive' })
+		}
+	}
+
+	const onReaction = async (reaction: string, messageId: string) => {
+		const token = await generateToken(session?.currentUser?._id)
+		try {
+			const { data } = await axiosClient.post<{ updatedMessage: IMessage }>(
+				'/api/user/reaction',
+				{ reaction, messageId },
+				{ headers: { Authorization: `Bearer ${token}` } }
+			)
+			setMessages(prev =>
+				prev.map(item => (item._id === data.updatedMessage._id ? { ...item, reaction: data.updatedMessage.reaction } : item))
+			)
+			socket.current?.emit('updateMessage', {
+				updatedMessage: data.updatedMessage,
+				receiver: currentContact,
+				sender: session?.currentUser,
+			})
+		} catch {
+			toast({ description: 'Cannot react to message', variant: 'destructive' })
+		}
+	}
+
+	const onDeleteMessage = async (messageId: string) => {
+		const token = await generateToken(session?.currentUser?._id)
+		try {
+			const { data } = await axiosClient.delete<{ deletedMessage: IMessage }>(`/api/user/message/${messageId}`, {
+				headers: { Authorization: `Bearer ${token}` },
+			})
+			const filteredMessages = messages.filter(item => item._id !== data.deletedMessage._id)
+			const lastMessage = filteredMessages.length ? filteredMessages[filteredMessages.length - 1] : null
+			setMessages(filteredMessages)
+			socket.current?.emit('deleteMessage', {
+				deletedMessage: data.deletedMessage,
+				sender: session?.currentUser,
+				receiver: currentContact,
+				filteredMessages,
+			})
+			setContacts(prev =>
+				prev.map(item =>
+					item._id === currentContact?._id
+						? { ...item, lastMessage: item.lastMessage?._id === messageId ? lastMessage : item.lastMessage }
+						: item
+				)
+			)
+		} catch {
+			toast({ description: 'Cannot delete message', variant: 'destructive' })
+		}
+	}
+
 	return (
 		<>
-			{/* Sidebar */}
 			<div className='w-80 h-screen border-r fixed inset-0 z-50'>
-				{/* Loading */}
 				{isLoading && (
 					<div className='w-full h-[95vh] flex justify-center items-center'>
 						<Loader2 size={50} className='animate-spin' />
 					</div>
 				)}
 
-				{/* Contact list */}
 				{!isLoading && <ContactList contacts={contacts} />}
 			</div>
-			{/* Chat area */}
 			<div className='pl-80 w-full'>
-				{/* Add contact */}
 				{!currentContact?._id && <AddContact contactForm={contactForm} onCreateContact={onCreateContact} />}
 
-				{/* Chat */}
 				{currentContact?._id && (
 					<div className='w-full relative'>
-						{/*Top Chat  */}
 						<TopChat />
-						{/* Chat messages */}
-						<Chat messageForm={messageForm} onSendMessage={onSendMessage} messages={messages} />
+						<Chat
+							messageForm={messageForm}
+							onSubmitMessage={onSubmitMessage}
+							messages={messages}
+							onReadMessages={onReadMessages}
+							onReaction={onReaction}
+							onDeleteMessage={onDeleteMessage}
+						/>
 					</div>
 				)}
 			</div>
@@ -197,4 +371,7 @@ interface GetSocketType {
 	receiver: IUser
 	sender: IUser
 	newMessage: IMessage
+	updatedMessage: IMessage
+	deletedMessage: IMessage
+	filteredMessages: IMessage[]
 }
